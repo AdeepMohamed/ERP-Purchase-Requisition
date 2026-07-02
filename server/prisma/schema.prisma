@@ -1,0 +1,140 @@
+// Prisma schema for ERP Purchase Requisition-to-Order system
+// Database: Neon (serverless PostgreSQL)
+// Monetary values: stored as Int (paise/cents), never floats — avoids floating-point precision errors
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  // directUrl is used for migrations on Neon (bypasses connection pooler)
+  directUrl = env("DATABASE_URL")
+}
+
+// ─── Enums ──────────────────────────────────────────────────────────────────
+
+enum Role {
+  employee
+  manager
+  admin
+}
+
+enum UrgencyLevel {
+  low
+  medium
+  high
+  critical
+}
+
+enum RequisitionStatus {
+  pending           // Awaiting 1st-level approval
+  pending_2nd       // Awaiting dept-head 2nd-level approval (amount > threshold)
+  approved          // Fully approved — triggers PO creation
+  rejected          // Terminal state — cannot be edited/resubmitted
+}
+
+enum POStatus {
+  draft             // Auto-created on approval
+  sent              // Sent to supplier
+  received          // Goods received — triggers inventory update
+  cancelled
+}
+
+// ─── Models ─────────────────────────────────────────────────────────────────
+
+model User {
+  id            String   @id @default(cuid())
+  name          String
+  email         String   @unique
+  passwordHash  String
+  role          Role
+  department    String
+  isDeptHead    Boolean  @default(false)  // True = eligible for 2nd-level approvals
+  createdAt     DateTime @default(now())
+
+  // Relations — back-references
+  requisitions  Requisition[] @relation("RequesterRequisitions")
+  approvals     Approval[]    @relation("ApproverApprovals")
+  auditLogs     AuditLog[]    @relation("ActorLogs")
+
+  @@map("users")
+}
+
+model Requisition {
+  id              String            @id @default(cuid())
+  requesterId     String
+  requester       User              @relation("RequesterRequisitions", fields: [requesterId], references: [id])
+  itemName        String
+  quantity        Int               // Must be > 0 — enforced at application level
+  justification   String
+  urgency         UrgencyLevel
+  estimatedCostPaise Int           // Stored in paise (Int, not Float) — avoids float precision issues
+  status          RequisitionStatus @default(pending)
+  department      String            // Denormalized for row-level auth queries — avoids extra join
+  createdAt       DateTime          @default(now())
+  decidedAt       DateTime?         // Set when approved or rejected
+
+  // Relations
+  approval        Approval?
+  purchaseOrder   PurchaseOrder?
+
+  @@map("requisitions")
+}
+
+model Approval {
+  id              String      @id @default(cuid())
+  requisitionId   String      @unique  // One approval record per requisition
+  requisition     Requisition @relation(fields: [requisitionId], references: [id])
+  approverId      String
+  approver        User        @relation("ApproverApprovals", fields: [approverId], references: [id])
+  decision        String      // "approved" | "rejected" — validated in app layer
+  comment         String?     // Required when decision = "rejected" — enforced in service layer
+  decidedAt       DateTime    @default(now())
+
+  @@map("approvals")
+}
+
+model PurchaseOrder {
+  id              String      @id @default(cuid())
+  requisitionId   String      @unique  // FK ensures PO always linked to a requisition
+  requisition     Requisition @relation(fields: [requisitionId], references: [id])
+  poNumber        String      @unique  // Auto-generated: "PO-YYYYMMDD-XXXX"
+  status          POStatus    @default(draft)
+  supplier        String?     // Free-text for now; can be FK to a Supplier table later
+  unitCostPaise   Int?        // Cost per unit in paise — set when PO is confirmed/sent
+  totalCostPaise  Int?        // unitCostPaise × quantity — computed on status change to "sent"
+  createdAt       DateTime    @default(now())
+  receivedAt      DateTime?   // Set when status changes to "received"
+
+  @@map("purchase_orders")
+}
+
+model InventoryItem {
+  id                String   @id @default(cuid())
+  name              String
+  sku               String   @unique
+  quantityOnHand    Int      @default(0)  // DB CHECK constraint below prevents negative
+  reorderThreshold  Int      @default(10) // Below this = low-stock alert on dashboard
+  lastUpdated       DateTime @updatedAt
+
+  @@map("inventory_items")
+}
+
+model AuditLog {
+  id              String      @id @default(cuid())
+  entityType      String      // "requisition" | "purchase_order" | "inventory_item" | "user"
+  entityId        String      // ID of the entity that changed
+  action          String      // e.g., "submitted", "approved", "rejected", "received"
+  actorId         String
+  actor           User        @relation("ActorLogs", fields: [actorId], references: [id])
+  metadata        Json?       // Optional context (e.g., previous status, comment)
+  timestamp       DateTime    @default(now())
+
+  // IMPORTANT: No update or delete route exists for AuditLog — insert-only by design.
+  // This is enforced at the application layer (no PUT/DELETE endpoints) and by convention.
+  // entityType + entityId allows joining to the relevant table via application queries without Prisma FK.
+
+  @@map("audit_logs")
+}
